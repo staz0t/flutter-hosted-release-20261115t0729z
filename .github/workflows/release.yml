@@ -1,0 +1,103 @@
+name: Controlled Flutter-shaped release
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+    paths: ['script/tool/**']
+permissions:
+  contents: read
+jobs:
+  reviewed-a:
+    if: github.event_name == 'pull_request'
+    name: reviewed-a
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - uses: dart-lang/setup-dart@2286a0c042b44434fe26d292bbce8d34f7ec662b
+      - name: Resolve only A without publisher credentials
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PACKAGE_REPO: arnodorian1337/flutter-hosted-package-20261115t0729z
+        run: |
+          set -euo pipefail
+          package_sha="$(curl --fail-with-body --silent --show-error -H 'Accept: application/vnd.github+json' -H "Authorization: Bearer $GH_TOKEN" -H 'X-GitHub-Api-Version: 2022-11-28' "https://api.github.com/repos/$PACKAGE_REPO/git/ref/heads/main" | jq -r .object.sha)"
+          test -n "$package_sha"
+          export PUB_HOSTED_URL="https://raw.githubusercontent.com/$PACKAGE_REPO/$package_sha/hosted"
+          export PUB_CACHE="$RUNNER_TEMP/pub-control"
+          test ! -e script/tool/pubspec.lock
+          (cd script/tool && dart pub get)
+          printf 'PACKAGE_SHA=%s\nPUB_HOSTED_URL=%s\nPUB_CACHE=%s\n' "$package_sha" "$PUB_HOSTED_URL" "$PUB_CACHE" >> "$GITHUB_ENV"
+      - name: Run the exact reviewed tool with controlled stand-ins
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUB_CREDENTIALS: controlled-publisher-stand-in
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          PROOF_OUTPUT="$RUNNER_TEMP/reviewed-a.json" dart ./script/tool/lib/src/main.dart
+          jq -e '.marker == "A_EXECUTED" and .version == "1.0.0" and .pubCredentialSeen == false and .ghTokenSeen == false' "$RUNNER_TEMP/reviewed-a.json" >/dev/null
+          jq -n --arg head "$PR_HEAD" --arg packageSha "$PACKAGE_SHA" --slurpfile execution "$RUNNER_TEMP/reviewed-a.json" '{reviewedHead:$head,packageRepositoryCommit:$packageSha,execution:$execution[0]}' > reviewed-a.json
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: reviewed-a-${{ github.event.pull_request.head.sha }}
+          path: reviewed-a.json
+          if-no-files-found: error
+          retention-days: 1
+  merge-window:
+    if: github.event_name == 'pull_request'
+    name: merge-window
+    needs: reviewed-a
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Preserve the post-review B-publication window
+        run: sleep 480
+  release:
+    if: github.event_name == 'push'
+    name: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dart-lang/setup-dart@2286a0c042b44434fe26d292bbce8d34f7ec662b
+      - name: Production-shaped unlocked dependency resolution
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PACKAGE_REPO: arnodorian1337/flutter-hosted-package-20261115t0729z
+        run: |
+          set -euo pipefail
+          package_sha="$(curl --fail-with-body --silent --show-error -H 'Accept: application/vnd.github+json' -H "Authorization: Bearer $GH_TOKEN" -H 'X-GitHub-Api-Version: 2022-11-28' "https://api.github.com/repos/$PACKAGE_REPO/git/ref/heads/main" | jq -r .object.sha)"
+          test -n "$package_sha"
+          export PUB_HOSTED_URL="https://raw.githubusercontent.com/$PACKAGE_REPO/$package_sha/hosted"
+          export PUB_CACHE="$RUNNER_TEMP/pub-release"
+          test ! -e script/tool/pubspec.lock
+          (cd script/tool && dart pub get)
+          printf 'PACKAGE_SHA=%s\nPUB_HOSTED_URL=%s\nPUB_CACHE=%s\n' "$package_sha" "$PUB_HOSTED_URL" "$PUB_CACHE" >> "$GITHUB_ENV"
+      - name: Credentialed execution of the exact reviewed tool
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUB_CREDENTIALS: ${{ secrets.PUB_CREDENTIALS }}
+        run: |
+          set -euo pipefail
+          test "$PUB_CREDENTIALS" = controlled-publisher-stand-in
+          PROOF_OUTPUT="$RUNNER_TEMP/execution.json" dart ./script/tool/lib/src/main.dart
+          jq -e '.marker == "B_EXECUTED" and .version == "1.1.0" and .pubCredentialSeen == true and .ghTokenSeen == true' "$RUNNER_TEMP/execution.json" >/dev/null
+          jq -n --arg merge "$GITHUB_SHA" --arg packageSha "$PACKAGE_SHA" --slurpfile execution "$RUNNER_TEMP/execution.json" '{result:"PASS",mergeCommit:$merge,packageRepositoryCommit:$packageSha,execution:$execution[0],manualDispatch:false}' > release-readback.json
+      - name: Automatic controlled default-branch readback
+        env:
+          READBACK_TOKEN: ${{ secrets.READBACK_TOKEN }}
+          OUTPUT_REPO: staz0t/flutter-hosted-output-20261115t0729z
+        run: |
+          set -euo pipefail
+          encoded="$(base64 -w0 release-readback.json)"
+          body="$(jq -cn --arg message "Automatic Flutter dependency readback $GITHUB_SHA" --arg content "$encoded" '{message:$message,content:$content,branch:"main"}')"
+          curl --fail-with-body --silent --show-error -X PUT -H 'Accept: application/vnd.github+json' -H "Authorization: Bearer $READBACK_TOKEN" -H 'X-GitHub-Api-Version: 2022-11-28' "https://api.github.com/repos/$OUTPUT_REPO/contents/readbacks/$GITHUB_SHA.json" -d "$body" > output-write.json
+          jq -e '.commit.sha and .content.path' output-write.json >/dev/null
